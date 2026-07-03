@@ -91,7 +91,12 @@ async def send_file_to_user(client, user_id, file_id, protect_content_flag, file
             mention_line = f"Requested by: {requester_mention}"
             caption = f"{mention_line}\n\n{caption}" if caption else mention_line
 
-        # ── Step 1: send the file to the user (existing logic, untouched) ──
+        # Build stream/download buttons FIRST (requires forwarding to
+        # BIN_CHANNEL to obtain the message id/hash used in the URLs) so
+        # they can be attached to the very message we're about to send,
+        # instead of arriving as a separate follow-up message.
+        stream_row = await _build_stream_buttons(client, file_id)
+
         if FILE_CHANNEL_SENDING_MODE and FILE_CHANNELS:
             channel_id = random.choice(FILE_CHANNELS)
             sent_message = await client.send_cached_media(
@@ -103,26 +108,28 @@ async def send_file_to_user(client, user_id, file_id, protect_content_flag, file
             asyncio.create_task(auto_delete_file(client, sent_message, FILE_AUTO_DELETE_SECONDS))
 
             reply_markup = await create_file_buttons(client, sent_message)
+            buttons = list(reply_markup.inline_keyboard)
+            if stream_row:
+                buttons.append(stream_row)
+            combined_markup = InlineKeyboardMarkup(buttons)
 
             user_msg = await client.send_message(
                 chat_id=user_id,
                 text=f"**Your file is ready!**\n\nJoin the channel to view your file ",
                 protect_content=True,
-                reply_markup=reply_markup
+                reply_markup=combined_markup,
             )
             asyncio.create_task(auto_delete_message(client, user_msg, AUTO_DELETE_SECONDS))
-            # Stream + Download buttons for channel-mode path
-            await _attach_stream_buttons(client, user_msg, file_id)
         else:
-            # Direct send
-            sent_to_user = await client.send_cached_media(
+            # Direct send — file + stream/download buttons in ONE message.
+            combined_markup = InlineKeyboardMarkup([stream_row]) if stream_row else None
+            await client.send_cached_media(
                 chat_id=user_id,
                 file_id=file_id,
                 caption=caption,
                 protect_content=protect_content_flag,
+                reply_markup=combined_markup,
             )
-            # Stream + Download buttons for direct-send path
-            await _attach_stream_buttons(client, sent_to_user, file_id)
 
     except Exception as e:
         logger.error(f"File send error: {e}")
@@ -138,15 +145,17 @@ async def send_file_to_user(client, user_id, file_id, protect_content_flag, file
             logger.error(f"Fallback send also failed: {e2}")
 
 
-async def _attach_stream_buttons(client, sent_msg, file_id: str):
+async def _build_stream_buttons(client, file_id: str):
     """
-    Forward the just-sent file to BIN_CHANNEL, generate stream + download URLs,
-    then reply to the user's file with  [ 🌐 Stream | ⬇ Download ].
+    Forward the file to BIN_CHANNEL and build a single button row
+    [ 🌐 Stream | ⬇ Download ]. Returns None (not an empty list) if
+    streaming isn't configured or anything fails, so callers can safely
+    skip appending it without sending a malformed keyboard.
     """
-    logger.info(f"[STREAM] _attach_stream_buttons called | STREAM_BASE_URL={repr(STREAM_BASE_URL)} | BIN_CHANNEL={repr(BIN_CHANNEL)}")
+    logger.info(f"[STREAM] _build_stream_buttons called | STREAM_BASE_URL={repr(STREAM_BASE_URL)} | BIN_CHANNEL={repr(BIN_CHANNEL)}")
     if not STREAM_BASE_URL or not BIN_CHANNEL:
         logger.warning(f"[STREAM] Skipping — STREAM_BASE_URL or BIN_CHANNEL not set")
-        return
+        return None
     try:
         logger.info(f"[STREAM] Forwarding file_id={file_id[:20]}... to BIN_CHANNEL={BIN_CHANNEL}")
         bin_msg = await client.send_cached_media(
@@ -156,19 +165,13 @@ async def _attach_stream_buttons(client, sent_msg, file_id: str):
         logger.info(f"[STREAM] Forwarded to BIN_CHANNEL, msg_id={bin_msg.id}")
         links = gen_stream_links(bin_msg, STREAM_BASE_URL)
         logger.info(f"[STREAM] stream_link={links['stream_link']}")
-        markup = InlineKeyboardMarkup([[
+        return [
             styled_button("🌐 Stream",   url=links["stream_link"]),
             styled_button("⬇ Download", url=links["online_link"]),
-        ]])
-        await sent_msg.reply_text(
-            "**Watch or download your file:**",
-            reply_markup=markup,
-            disable_web_page_preview=True,
-            quote=True,
-        )
-        logger.info(f"[STREAM] Buttons sent successfully")
+        ]
     except Exception as e:
-        logger.error(f"[STREAM] Error in _attach_stream_buttons: {e}", exc_info=True)
+        logger.error(f"[STREAM] Error in _build_stream_buttons: {e}", exc_info=True)
+        return None
 
 
 
