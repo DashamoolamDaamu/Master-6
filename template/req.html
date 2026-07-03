@@ -354,6 +354,92 @@
     </script>
     <!-- Main Script (CDN-hosted) -->
     <script src="https://cdn.jsdelivr.net/gh/fyaz05/Resources@main/FileToLink/Obsidian%20Ember/script.js"></script>
+
+    <!-- Diagnostic instrumentation: reports player lifecycle to server logs
+         via /client-log so we can debug real (including mobile) users
+         without needing browser DevTools. Safe to remove once resolved. -->
+    <script>
+    (function () {
+        var ENDPOINT = "/client-log";
+        var src = (window.__CINEMA_CONFIG__ && window.__CINEMA_CONFIG__.src) || null;
+
+        function report(event, detail) {
+            var payload = JSON.stringify({
+                event: event,
+                detail: detail === undefined ? null : String(detail).slice(0, 300),
+                src: src,
+                t: Date.now()
+            });
+            try {
+                if (navigator.sendBeacon) {
+                    navigator.sendBeacon(ENDPOINT, new Blob([payload], { type: "text/plain" }));
+                } else {
+                    fetch(ENDPOINT, { method: "POST", body: payload, keepalive: true });
+                }
+            } catch (e) { /* never let logging break playback */ }
+        }
+
+        report("page-load", "config_src_present=" + (!!src));
+
+        // Catch any uncaught JS error anywhere on the page (including inside
+        // the CDN script.js) — if this fires before the other events below,
+        // it tells us script.js crashed before it could init the player.
+        window.addEventListener("error", function (e) {
+            report("js-error", (e && e.message) || "unknown error");
+        });
+        window.addEventListener("unhandledrejection", function (e) {
+            report("js-unhandled-rejection", (e && e.reason) || "unknown rejection");
+        });
+
+        function attach(player) {
+            report("player-element-found", "tag=" + player.tagName);
+
+            // Poll for .src being assigned, since we don't control script.js
+            // and don't know exactly when/how it sets it.
+            var checks = 0;
+            var srcPoll = setInterval(function () {
+                checks++;
+                if (player.src) {
+                    report("player-src-assigned", player.src);
+                    clearInterval(srcPoll);
+                } else if (checks > 40) { // ~20s at 500ms
+                    report("player-src-never-assigned", "gave up after " + checks + " checks");
+                    clearInterval(srcPoll);
+                }
+            }, 500);
+
+            [
+                "provider-change", "provider-setup", "source-change",
+                "load-start", "loaded-metadata", "can-play", "can-play-through",
+                "playing", "waiting", "stalled", "error"
+            ].forEach(function (evt) {
+                player.addEventListener(evt, function (e) {
+                    var detail;
+                    try { detail = JSON.stringify(e.detail).slice(0, 200); }
+                    catch (_) { detail = String(e.detail); }
+                    report("media-event:" + evt, detail);
+                });
+            });
+        }
+
+        customElements.whenDefined("media-player").then(function () {
+            report("media-player-upgraded");
+            var el = document.querySelector("media-player");
+            if (el) attach(el);
+            else report("media-player-not-found-in-dom");
+        }).catch(function (e) {
+            report("media-player-upgrade-failed", e);
+        });
+
+        // If the custom element module never even loads/registers within
+        // 10s, whenDefined() above will just hang silently — surface that.
+        setTimeout(function () {
+            if (!customElements.get("media-player")) {
+                report("media-player-still-undefined-after-10s");
+            }
+        }, 10000);
+    })();
+    </script>
 </body>
 
 </html>
