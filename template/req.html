@@ -27,10 +27,14 @@
     <meta name="twitter:description" content="Stream '{{ file_name }}' in a beautiful, atmospheric environment.">
     <meta name="twitter:image" content="https://cdn.jsdelivr.net/gh/fyaz05/Resources@main/FileToLink/logo.png">
 
-    <!-- Vidstack Player -->
-    <link rel="stylesheet" href="https://cdn.vidstack.io/player/theme.css" />
-    <link rel="stylesheet" href="https://cdn.vidstack.io/player/video.css" />
-    <script type="module" src="https://cdn.vidstack.io/player"></script>
+    <!-- Native HTML5 video — no third-party player JS/CDN dependency.
+         (The reference streaming implementation has no embedded web player
+         at all; it serves a raw byte-range URL and lets the browser/OS
+         handle playback. This mirrors that: zero external script needed
+         for playback itself to work.) -->
+    <style>
+        video.native-player { width: 100%; height: 100%; background: #000; }
+    </style>
 
     <!-- Typography: Outfit (geometric display) + DM Sans (refined body) -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -105,10 +109,12 @@
                     <span class="bg-msg-title">If video not playing</span>
                     <span class="bg-msg-sub">Use External Player</span>
                 </div>
-                <media-player id="player" title="{{ file_name }}" playsinline keyTarget="document">
-                    <media-provider></media-provider>
-                    <media-video-layout></media-video-layout>
-                </media-player>
+                <video id="player" class="native-player" controls playsinline preload="metadata"
+                    title="{{ file_name }}" poster="">
+                    <source src="{{ src|safe }}">
+                    Your browser does not support HTML5 video. Use the Download button
+                    or an external player below.
+                </video>
             </div>
         </section>
 
@@ -348,20 +354,19 @@
     <!-- Toast Stack -->
     <div class="toast-stack" id="toastStack" aria-live="polite"></div>
 
-    <!-- Config for external script (template injection happens here) -->
+    <!-- Config (kept for reference / consistency with links used elsewhere) -->
     <script>
         window.__CINEMA_CONFIG__ = { src: {{ src | tojson }} };
     </script>
-    <!-- Main Script (CDN-hosted) -->
-    <script src="https://cdn.jsdelivr.net/gh/fyaz05/Resources@main/FileToLink/Obsidian%20Ember/script.js"></script>
 
-    <!-- Diagnostic instrumentation: reports player lifecycle to server logs
-         via /client-log so we can debug real (including mobile) users
-         without needing browser DevTools. Safe to remove once resolved. -->
+    <!-- Self-contained UI + playback script. No external CDN JS dependency
+         for anything on this page anymore. Reports lifecycle to /client-log
+         so real (including mobile) user sessions are debuggable from server
+         logs without DevTools. -->
     <script>
     (function () {
         var ENDPOINT = "/client-log";
-        var src = (window.__CINEMA_CONFIG__ && window.__CINEMA_CONFIG__.src) || null;
+        var src = window.__CINEMA_CONFIG__.src;
 
         function report(event, detail) {
             var payload = JSON.stringify({
@@ -379,11 +384,8 @@
             } catch (e) { /* never let logging break playback */ }
         }
 
-        report("page-load", "config_src_present=" + (!!src));
+        report("page-load");
 
-        // Catch any uncaught JS error anywhere on the page (including inside
-        // the CDN script.js) — if this fires before the other events below,
-        // it tells us script.js crashed before it could init the player.
         window.addEventListener("error", function (e) {
             report("js-error", (e && e.message) || "unknown error");
         });
@@ -391,53 +393,70 @@
             report("js-unhandled-rejection", (e && e.reason) || "unknown rejection");
         });
 
-        function attach(player) {
-            report("player-element-found", "tag=" + player.tagName);
-
-            // Poll for .src being assigned, since we don't control script.js
-            // and don't know exactly when/how it sets it.
-            var checks = 0;
-            var srcPoll = setInterval(function () {
-                checks++;
-                if (player.src) {
-                    report("player-src-assigned", player.src);
-                    clearInterval(srcPoll);
-                } else if (checks > 40) { // ~20s at 500ms
-                    report("player-src-never-assigned", "gave up after " + checks + " checks");
-                    clearInterval(srcPoll);
-                }
-            }, 500);
-
+        // ── Native <video> instrumentation ──────────────────────────────
+        var video = document.getElementById("player");
+        if (video) {
+            report("video-element-found", "src=" + video.currentSrc);
             [
-                "provider-change", "provider-setup", "source-change",
-                "load-start", "loaded-metadata", "can-play", "can-play-through",
-                "playing", "waiting", "stalled", "error"
+                "loadstart", "loadedmetadata", "loadeddata", "canplay",
+                "canplaythrough", "playing", "waiting", "stalled", "suspend",
+                "abort", "emptied", "error"
             ].forEach(function (evt) {
-                player.addEventListener(evt, function (e) {
-                    var detail;
-                    try { detail = JSON.stringify(e.detail).slice(0, 200); }
-                    catch (_) { detail = String(e.detail); }
-                    report("media-event:" + evt, detail);
+                video.addEventListener(evt, function () {
+                    var detail = evt === "error" && video.error
+                        ? ("code=" + video.error.code + " msg=" + video.error.message)
+                        : ("readyState=" + video.readyState + " networkState=" + video.networkState);
+                    report("video:" + evt, detail);
                 });
+            });
+        } else {
+            report("video-element-not-found");
+        }
+
+        // ── Duration / resolution meta text ─────────────────────────────
+        var durEl = document.querySelector("#metaDuration span:last-child");
+        var resEl = document.querySelector("#metaResolution span:last-child");
+        if (video) {
+            video.addEventListener("loadedmetadata", function () {
+                if (durEl) {
+                    var s = Math.floor(video.duration || 0);
+                    var mm = Math.floor(s / 60), ss = s % 60;
+                    durEl.textContent = mm + ":" + (ss < 10 ? "0" : "") + ss;
+                }
+                if (resEl && video.videoWidth) {
+                    resEl.textContent = video.videoWidth + "x" + video.videoHeight;
+                }
             });
         }
 
-        customElements.whenDefined("media-player").then(function () {
-            report("media-player-upgraded");
-            var el = document.querySelector("media-player");
-            if (el) attach(el);
-            else report("media-player-not-found-in-dom");
-        }).catch(function (e) {
-            report("media-player-upgrade-failed", e);
-        });
+        // ── Copy link button ─────────────────────────────────────────────
+        var copyBtn = document.getElementById("copyBtn");
+        if (copyBtn) {
+            copyBtn.addEventListener("click", function () {
+                navigator.clipboard && navigator.clipboard.writeText(src).catch(function () {});
+            });
+        }
 
-        // If the custom element module never even loads/registers within
-        // 10s, whenDefined() above will just hang silently — surface that.
-        setTimeout(function () {
-            if (!customElements.get("media-player")) {
-                report("media-player-still-undefined-after-10s");
-            }
-        }, 10000);
+        // ── External players drawer toggle ──────────────────────────────
+        var playersToggle = document.getElementById("playersToggle");
+        var playersDrawer = document.getElementById("playersDrawer");
+        if (playersToggle && playersDrawer) {
+            playersToggle.addEventListener("click", function () {
+                var open = playersDrawer.classList.toggle("open");
+                playersToggle.setAttribute("aria-expanded", open ? "true" : "false");
+            });
+        }
+
+        // ── Theme toggle (simple class flip; CSS supplies the two themes) ──
+        var themeToggle = document.getElementById("themeToggle");
+        if (themeToggle) {
+            themeToggle.addEventListener("click", function () {
+                document.documentElement.classList.toggle("light-theme");
+            });
+        }
+
+        var yearEl = document.getElementById("copyrightYear");
+        if (yearEl) yearEl.textContent = new Date().getFullYear();
     })();
     </script>
 </body>
