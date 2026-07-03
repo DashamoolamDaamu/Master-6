@@ -141,11 +141,9 @@ async def _serve_media(
         raise webserver.HTTPNotFound(text="File size unavailable")
 
     range_header = request.headers.get("Range", "")
+    had_range    = bool(range_header)
     start, end   = _parse_range_header(range_header, file_size)
     content_len  = end - start + 1
-
-    if start == 0 and end == file_size - 1:
-        range_header = ""
 
     mime_type = file_info.get("mime_type") or "application/octet-stream"
     filename  = _resolve_filename(file_info, mime_type)
@@ -161,12 +159,24 @@ async def _serve_media(
         **CORS_HEADERS,
         "X-Content-Type-Options": "nosniff",
     }
-    if range_header:
+    # A request that arrived WITH a Range header must always get a 206 +
+    # Content-Range back, even if the requested range happens to cover the
+    # whole file (browsers send "Range: bytes=0-" as a capability probe and
+    # expect 206 to enable streaming/seek mode; collapsing that to a plain
+    # 200 breaks the video element's ability to detect range support).
+    if had_range:
         headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
 
+    status = 206 if had_range else 200
+
+    logger.info(
+        f"stream request: range={request.headers.get('Range')!r} "
+        f"start={start} end={end} size={file_size} status={status} "
+        f"ua={request.headers.get('User-Agent', '')[:60]!r}"
+    )
+
     if request.method == "HEAD":
-        return webserver.Response(
-            status=206 if range_header else 200, headers=headers)
+        return webserver.Response(status=status, headers=headers)
 
     _work_loads[0] += 1
 
@@ -195,7 +205,7 @@ async def _serve_media(
             _work_loads[0] -= 1
 
     return webserver.Response(
-        status=206 if range_header else 200,
+        status=status,
         body=stream_generator(),
         headers=headers,
     )
