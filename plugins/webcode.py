@@ -9,6 +9,7 @@
 #   GET /{path}         → stream or download the file (byte range supported)
 #   OPTIONS /{path}     → CORS preflight
 
+import asyncio
 import re
 import secrets
 import time
@@ -132,13 +133,15 @@ async def _serve_media(
     *,
     file_info: dict,
     media_ref: int,
-) -> webserver.Response:
+) -> webserver.StreamResponse:
     if _streamer is None:
         raise webserver.HTTPServiceUnavailable(text="Streamer not initialised")
 
     file_size = int(file_info.get("file_size", 0) or 0)
     if file_size == 0:
         raise webserver.HTTPNotFound(text="File size unavailable")
+
+    req_id = secrets.token_hex(4)  # correlates every log line for this request
 
     range_header = request.headers.get("Range", "")
     had_range    = bool(range_header)
@@ -159,61 +162,133 @@ async def _serve_media(
         **CORS_HEADERS,
         "X-Content-Type-Options": "nosniff",
     }
-    # A request that arrived WITH a Range header must always get a 206 +
-    # Content-Range back, even if the requested range happens to cover the
-    # whole file (browsers send "Range: bytes=0-" as a capability probe and
-    # expect 206 to enable streaming/seek mode; collapsing that to a plain
-    # 200 breaks the video element's ability to detect range support).
     if had_range:
         headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
 
     status = 206 if had_range else 200
 
     logger.info(
-        f"stream request: range={request.headers.get('Range')!r} "
-        f"start={start} end={end} size={file_size} status={status} "
-        f"ua={request.headers.get('User-Agent', '')[:60]!r}"
+        f"[{req_id}] REQUEST method={request.method} path={request.path} "
+        f"range={range_header!r} start={start} end={end} content_len={content_len} "
+        f"file_size={file_size} status={status} disposition={disp} mime={mime_type} "
+        f"remote={request.remote} ua={request.headers.get('User-Agent', '')[:80]!r}"
     )
 
     if request.method == "HEAD":
+        logger.info(f"[{req_id}] HEAD response only, no body sent")
         return webserver.Response(status=status, headers=headers)
 
+    # ── StreamResponse: explicit prepare/write/write_eof, no ambiguity about
+    #    chunked vs fixed-length framing (unlike Response(body=async_gen)).
+    resp = webserver.StreamResponse(status=status, headers=headers)
+    await resp.prepare(request)
+    logger.info(f"[{req_id}] headers sent, status={status}")
+
     _work_loads[0] += 1
+    bytes_sent    = 0
+    bytes_to_skip = start % CHUNK_SIZE
+    chunk_index   = 0
 
-    async def stream_generator():
-        try:
-            bytes_sent   = 0
-            bytes_to_skip = start % CHUNK_SIZE
-            async for chunk in _streamer.stream_file(
-                media_ref, offset=start, limit=content_len
-            ):
-                if bytes_to_skip > 0:
-                    if len(chunk) <= bytes_to_skip:
-                        bytes_to_skip -= len(chunk)
-                        continue
-                    chunk = chunk[bytes_to_skip:]
-                    bytes_to_skip = 0
-                remaining = content_len - bytes_sent
-                if len(chunk) > remaining:
-                    chunk = chunk[:remaining]
-                if chunk:
-                    yield chunk
-                    bytes_sent += len(chunk)
-                if bytes_sent >= content_len:
-                    break
-        finally:
-            _work_loads[0] -= 1
+    try:
+        async for chunk in _streamer.stream_file(
+            media_ref, offset=start, limit=content_len
+        ):
+            if bytes_to_skip > 0:
+                if len(chunk) <= bytes_to_skip:
+                    bytes_to_skip -= len(chunk)
+                    continue
+                chunk = chunk[bytes_to_skip:]
+                bytes_to_skip = 0
 
-    return webserver.Response(
-        status=status,
-        body=stream_generator(),
-        headers=headers,
-    )
+            remaining = content_len - bytes_sent
+            if len(chunk) > remaining:
+                chunk = chunk[:remaining]
+
+            if chunk:
+                await resp.write(chunk)
+                bytes_sent += len(chunk)
+                chunk_index += 1
+                # Per-chunk detail at DEBUG (can be thousands of lines for a
+                # full movie); a running summary every 20 chunks at INFO so
+                # you can watch progress live in Koyeb logs without noise.
+                logger.debug(
+                    f"[{req_id}] chunk#{chunk_index} size={len(chunk)} "
+                    f"bytes_sent={bytes_sent}/{content_len}"
+                )
+                if chunk_index % 20 == 0:
+                    logger.info(
+                        f"[{req_id}] progress chunk#{chunk_index} "
+                        f"bytes_sent={bytes_sent}/{content_len} "
+                        f"({bytes_sent * 100 // content_len}%)"
+                    )
+
+            if bytes_sent >= content_len:
+                break
+
+        await resp.write_eof()
+        logger.info(
+            f"[{req_id}] COMPLETE chunks={chunk_index} bytes_sent={bytes_sent} "
+            f"expected={content_len} match={bytes_sent == content_len}"
+        )
+
+    except (ConnectionResetError, asyncio.CancelledError) as e:
+        # Client (or the mobile OS switching apps / locking screen) closed
+        # the connection mid-stream. Not a server bug, but we want it visible
+        # and distinguishable from a real exception below.
+        logger.warning(
+            f"[{req_id}] CLIENT DISCONNECTED after chunk#{chunk_index} "
+            f"bytes_sent={bytes_sent}/{content_len}: {type(e).__name__}"
+        )
+        raise
+    except Exception as e:
+        logger.error(
+            f"[{req_id}] STREAM ERROR after chunk#{chunk_index} "
+            f"bytes_sent={bytes_sent}/{content_len}: {e}",
+            exc_info=True,
+        )
+        raise
+    finally:
+        _work_loads[0] -= 1
+
+    return resp
 
 
 # ─── Route table ──────────────────────────────────────────────────────────────
 
 routes = webserver.RouteTableDef()
+
+
+@routes.options("/client-log")
+async def client_log_options(request: webserver.Request):
+    return webserver.Response(
+        headers={**CORS_HEADERS, "Access-Control-Max-Age": "86400"})
+
+
+@routes.post("/client-log")
+async def client_log_endpoint(request: webserver.Request):
+    """
+    Receives small JSON beacons from the in-page instrumentation script
+    (see req.html) and writes them into the same server logs. This is what
+    lets us see player/JS state from real mobile browsers without DevTools.
+    Body is capped and best-effort: a bad/oversized payload must never 500.
+    """
+    try:
+        raw = await request.text()
+        if len(raw) > 4096:
+            raw = raw[:4096]
+        try:
+            import json
+            data = json.loads(raw)
+        except Exception:
+            data = {"raw": raw}
+        logger.info(
+            f"[CLIENT] remote={request.remote} ua={request.headers.get('User-Agent','')[:80]!r} "
+            f"event={data.get('event')!r} detail={data.get('detail')!r} "
+            f"src={data.get('src')!r} t={data.get('t')!r}"
+        )
+    except Exception as e:
+        logger.debug(f"client-log beacon parse failure: {e}")
+    return webserver.Response(status=204, headers=CORS_HEADERS)
 
 
 @routes.get("/", allow_head=True)
